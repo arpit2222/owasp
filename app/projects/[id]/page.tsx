@@ -14,6 +14,15 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import type {
+  Project,
+  RepositorySummary,
+  IssueSummary,
+  MilestoneSummary,
+  ReleaseSummary,
+  RepositoryWithMeta,
+} from "@/app/lib/types";
+import { calculateProjectHealth } from "@/app/lib/health";
 
 interface ProjectDetailsPageProps {
   params: Promise<{
@@ -21,46 +30,101 @@ interface ProjectDetailsPageProps {
   }>;
 }
 
-interface RepositorySummary {
-  id: string;
-  name: string;
-  provider?: string;
-  url?: string;
+function getStatusBadgeClasses(status: string): string {
+  switch (status) {
+    case "Healthy":
+      return "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300";
+    case "Active":
+      return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
+    case "Needs Attention":
+      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
+    case "Stale":
+    default:
+      return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300";
+  }
 }
 
-interface IssueSummary {
-  id: string;
-  title: string;
-  state?: string;
-  url?: string;
-  raw: any;
+function getScoreTextClasses(status: string): string {
+  switch (status) {
+    case "Healthy":
+      return "text-emerald-600 dark:text-emerald-300";
+    case "Active":
+      return "text-blue-600 dark:text-blue-300";
+    case "Needs Attention":
+      return "text-amber-600 dark:text-amber-300";
+    case "Stale":
+    default:
+      return "text-red-600 dark:text-red-300";
+  }
 }
 
-interface MilestoneSummary {
-  id: string;
-  title: string;
-  state?: string;
-  dueOn?: string;
-  raw: any;
+function getMetricTextClasses(score: number, max: number): string {
+  if (max <= 0) return "";
+  const ratio = score / max;
+
+  if (ratio >= 0.75) {
+    return "text-emerald-600 dark:text-emerald-300";
+  }
+  if (ratio >= 0.4) {
+    return "text-amber-600 dark:text-amber-300";
+  }
+  return "text-red-600 dark:text-red-300";
 }
 
-interface ReleaseSummary {
-  id: string;
-  tagName: string;
-  name?: string;
-  createdAt?: string;
-  publishedAt?: string;
-  url?: string;
-  raw: any;
+function buildSparklinePath(dates: (string | Date | undefined)[]): string | null {
+  const parsed = dates
+    .map((d) => (d ? new Date(d) : null))
+    .filter((d): d is Date => d !== null && !Number.isNaN(d.getTime()));
+
+  if (parsed.length === 0) return null;
+
+  const sorted = parsed.sort((a, b) => a.getTime() - b.getTime());
+  const min = sorted[0].getTime();
+  const max = sorted[sorted.length - 1].getTime();
+  const range = max - min || 1;
+
+  const width = 80;
+  const height = 24;
+
+  const points = sorted.map((d, index) => {
+    const x = (index / Math.max(sorted.length - 1, 1)) * width;
+    const t = (d.getTime() - min) / range;
+    const y = height - t * height;
+    return { x, y };
+  });
+
+  return points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+    .join(" ");
 }
 
-interface RepositoryWithMeta extends RepositorySummary {
-  issues: IssueSummary[];
-  milestones: MilestoneSummary[];
-  releases: ReleaseSummary[];
+function buildIssuePieSegments(open: number, closed: number, other: number) {
+  const total = open + closed + other;
+  if (total <= 0) return null;
+
+  const radius = 12;
+  const circumference = 2 * Math.PI * radius;
+
+  const openFrac = open / total;
+  const closedFrac = closed / total;
+  const otherFrac = other / total;
+
+  const openLen = openFrac * circumference;
+  const closedLen = closedFrac * circumference;
+  const otherLen = otherFrac * circumference;
+
+  return {
+    radius,
+    circumference,
+    segments: [
+      { len: openLen, color: "stroke-blue-500" },
+      { len: closedLen, color: "stroke-emerald-500" },
+      { len: otherLen, color: "stroke-amber-400" },
+    ],
+  };
 }
 
-async function getProject(nest: NestCore, projectId: string) {
+async function getProject(nest: NestCore, projectId: string): Promise<Project | null> {
   const res = await projectsGetProject(nest, {
     projectId,
   });
@@ -250,38 +314,254 @@ export default async function ProjectDetailsPage({ params }: ProjectDetailsPageP
     notFound();
   }
 
+  const health = calculateProjectHealth(project as Project, repositories);
+
+   const allIssues = repositories.flatMap((repo) => repo.issues ?? []);
+   const aggregateOpenIssues = allIssues.filter(
+     (issue) => issue.state?.toLowerCase() === "open"
+   ).length;
+   const aggregateClosedIssues = allIssues.filter(
+     (issue) => issue.state?.toLowerCase() === "closed"
+   ).length;
+   const aggregateOtherIssues = allIssues.length - aggregateOpenIssues - aggregateClosedIssues;
+
+   const aggregateMilestoneDates = repositories.flatMap((repo) =>
+     (repo.milestones ?? []).map((m) => m.dueOn)
+   );
+   const aggregateReleaseDates = repositories.flatMap((repo) =>
+     (repo.releases ?? []).map((r) => r.publishedAt ?? r.createdAt)
+   );
+
   return (
     <main className="min-h-screen bg-gray-50 dark:bg-gray-900 p-8">
       <div className="max-w-4xl mx-auto space-y-6">
         <Card className="shadow-md">
           <CardHeader>
-            <CardTitle className="text-2xl font-bold text-gray-900 dark:text-white">
-              {project.name}
-            </CardTitle>
+            <div className="flex items-start justify-between gap-3">
+              <CardTitle className="text-2xl font-bold text-gray-900 dark:text-white">
+                {project.name ?? "Project"}
+              </CardTitle>
+              <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                <div className="relative group">
+                  <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-gray-300 dark:border-gray-600 text-[10px] cursor-default">
+                    i
+                  </span>
+                  <div className="absolute right-0 z-10 mt-2 w-64 rounded-md bg-white p-3 text-[11px] leading-snug shadow-lg ring-1 ring-black/5 opacity-0 group-hover:opacity-100 transition-opacity dark:bg-gray-900 dark:text-gray-200">
+                    Overall health is a weighted blend of maturity (project level),
+                    freshness (recent releases and updates), issue closure ratio, and
+                    milestone planning/overdue status.
+                  </div>
+                </div>
+              </div>
+            </div>
             {project.level && (
               <Badge className="mt-2 w-fit">{project.level}</Badge>
             )}
           </CardHeader>
-          <CardContent className="space-y-3 text-sm text-gray-700 dark:text-gray-300">
-            {project.key && (
+          <CardContent className="space-y-4 text-sm text-gray-700 dark:text-gray-300">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <span
+                className={"text-3xl font-bold " + getScoreTextClasses(health.status)}
+              >
+                {health.score}
+              </span>
+              <span
+                className={
+                  "px-2 py-0.5 rounded-full text-xs font-semibold " +
+                  getStatusBadgeClasses(health.status)
+                }
+              >
+                {health.status}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs md:text-sm">
               <div>
-                <span className="font-semibold">Key:</span> {project.key}
+                <div className="font-semibold">Maturity</div>
+                <div
+                  className={getMetricTextClasses(
+                    health.metrics.maturityScore,
+                    20
+                  )}
+                >
+                  {health.metrics.maturityScore} / 20
+                </div>
               </div>
-            )}
-            {project.createdAt && (
               <div>
-                <span className="font-semibold">Created:</span>{" "}
-                {new Date(project.createdAt).toLocaleString()}
+                <div className="font-semibold">Freshness</div>
+                <div
+                  className={getMetricTextClasses(
+                    health.metrics.freshnessScore,
+                    40
+                  )}
+                >
+                  {health.metrics.freshnessScore} / 40
+                </div>
               </div>
-            )}
-            {project.updatedAt && (
               <div>
-                <span className="font-semibold">Updated:</span>{" "}
-                {new Date(project.updatedAt).toLocaleString()}
+                <div className="font-semibold">Issues</div>
+                <div
+                  className={getMetricTextClasses(
+                    health.metrics.issueScore,
+                    25
+                  )}
+                >
+                  {health.metrics.issueScore} / 25
+                </div>
               </div>
-            )}
+              <div>
+                <div className="font-semibold">Milestones</div>
+                <div
+                  className={getMetricTextClasses(
+                    health.metrics.milestoneScore,
+                    15
+                  )}
+                >
+                  {health.metrics.milestoneScore} / 15
+                </div>
+              </div>
+            </div>
+
+            <div className="border-t border-gray-200 dark:border-gray-800 pt-3 mt-2 space-y-1">
+              {project.key && (
+                <div>
+                  <span className="font-semibold">Key:</span>{" "}
+                  {String(project.key)}
+                </div>
+              )}
+              {project.createdAt && (
+                <div>
+                  <span className="font-semibold">Created:</span>{" "}
+                  {new Date(project.createdAt).toLocaleString()}
+                </div>
+              )}
+              {project.updatedAt && (
+                <div>
+                  <span className="font-semibold">Updated:</span>{" "}
+                  {new Date(project.updatedAt).toLocaleString()}
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
+
+        {(aggregateMilestoneDates.length > 0 ||
+          aggregateReleaseDates.length > 0 ||
+          allIssues.length > 0) && (
+          <Card className="shadow-md">
+            <CardHeader>
+              <CardTitle className="text-lg font-semibold text-gray-900 dark:text-white">
+                Project activity overview
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4 text-xs md:text-sm text-gray-700 dark:text-gray-300">
+              {allIssues.length > 0 && (
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="font-semibold mb-1">Issues (all repositories)</div>
+                    <div className="space-x-2">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-blue-500" /> Open
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-emerald-500" /> Closed
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-amber-400" /> Other
+                      </span>
+                    </div>
+                  </div>
+                  {(() => {
+                    const pie = buildIssuePieSegments(
+                      aggregateOpenIssues,
+                      aggregateClosedIssues,
+                      aggregateOtherIssues
+                    );
+                    if (!pie) return null;
+                    let offset = 0;
+                    return (
+                      <svg
+                        width={40}
+                        height={40}
+                        viewBox="0 0 40 40"
+                        className="shrink-0"
+                      >
+                        <g transform="translate(20,20)">
+                          {pie.segments.map((seg, idx) => {
+                            const strokeDasharray = `${seg.len} ${pie.circumference}`;
+                            const strokeDashoffset = -offset;
+                            offset += seg.len;
+                            return (
+                              <circle
+                                key={idx}
+                                r={pie.radius}
+                                className={seg.color}
+                                strokeWidth={8}
+                                fill="transparent"
+                                strokeDasharray={strokeDasharray}
+                                strokeDashoffset={strokeDashoffset}
+                              />
+                            );
+                          })}
+                        </g>
+                      </svg>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {aggregateMilestoneDates.length > 0 && (
+                <div className="space-y-1">
+                  <div className="font-semibold">Milestones over time (all repositories)</div>
+                  {(() => {
+                    const path = buildSparklinePath(aggregateMilestoneDates);
+                    if (!path) return null;
+                    return (
+                      <svg
+                        width="100%"
+                        height={28}
+                        viewBox="0 0 80 24"
+                        className="text-emerald-500"
+                      >
+                        <path
+                          d={path}
+                          className="stroke-current"
+                          strokeWidth={2}
+                          fill="none"
+                        />
+                      </svg>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {aggregateReleaseDates.length > 0 && (
+                <div className="space-y-1">
+                  <div className="font-semibold">Releases over time (all repositories)</div>
+                  {(() => {
+                    const path = buildSparklinePath(aggregateReleaseDates);
+                    if (!path) return null;
+                    return (
+                      <svg
+                        width="100%"
+                        height={28}
+                        viewBox="0 0 80 24"
+                        className="text-blue-500"
+                      >
+                        <path
+                          d={path}
+                          className="stroke-current"
+                          strokeWidth={2}
+                          fill="none"
+                        />
+                      </svg>
+                    );
+                  })()}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
 
         <Card className="shadow-md">
           <CardHeader>
@@ -359,22 +639,47 @@ export default async function ProjectDetailsPage({ params }: ProjectDetailsPageP
                             No milestones.
                           </p>
                         ) : (
-                          <ul className="space-y-1 text-xs md:text-sm">
-                            {repo.milestones.map((m) => (
-                              <li key={m.id} className="border border-gray-200 dark:border-gray-700 rounded px-2 py-1 space-y-1">
-                                <div className="font-medium">{m.title}</div>
-                                <div className="text-[11px] text-gray-500 dark:text-gray-400">
-                                  {m.state && <span>Status: {m.state}</span>}
-                                  {m.dueOn && (
-                                    <span>
-                                      {m.state ? " · " : ""}
-                                      Due: {new Date(m.dueOn).toLocaleDateString()}
-                                    </span>
-                                  )}
-                                </div>
-                              </li>
-                            ))}
-                          </ul>
+                          <>
+                            <div className="mb-1">
+                              {(() => {
+                                const path = buildSparklinePath(
+                                  repo.milestones.map((m) => m.dueOn)
+                                );
+                                if (!path) return null;
+                                return (
+                                  <svg
+                                    width="100%"
+                                    height={24}
+                                    viewBox="0 0 80 24"
+                                    className="text-emerald-500"
+                                  >
+                                    <path
+                                      d={path}
+                                      className="stroke-current"
+                                      strokeWidth={2}
+                                      fill="none"
+                                    />
+                                  </svg>
+                                );
+                              })()}
+                            </div>
+                            <ul className="space-y-1 text-xs md:text-sm">
+                              {repo.milestones.map((m) => (
+                                <li key={m.id} className="border border-gray-200 dark:border-gray-700 rounded px-2 py-1 space-y-1">
+                                  <div className="font-medium">{m.title}</div>
+                                  <div className="text-[11px] text-gray-500 dark:text-gray-400">
+                                    {m.state && <span>Status: {m.state}</span>}
+                                    {m.dueOn && (
+                                      <span>
+                                        {m.state ? " · " : ""}
+                                        Due: {new Date(m.dueOn).toLocaleDateString()}
+                                      </span>
+                                    )}
+                                  </div>
+                                </li>
+                              ))}
+                            </ul>
+                          </>
                         )}
                       </section>
 
@@ -387,32 +692,86 @@ export default async function ProjectDetailsPage({ params }: ProjectDetailsPageP
                             No issues.
                           </p>
                         ) : (
-                          <ul className="space-y-1 text-xs md:text-sm">
-                            {repo.issues.map((issue) => (
-                              <li key={issue.id} className="border border-gray-200 dark:border-gray-700 rounded px-2 py-1 space-y-1">
-                                <div className="flex justify-between gap-2">
-                                  <div>
-                                    <div className="font-medium">{issue.title}</div>
-                                    {issue.state && (
-                                      <div className="text-[11px] text-gray-500 dark:text-gray-400">
-                                        Status: {issue.state}
-                                      </div>
+                          <>
+                            {(() => {
+                              const open = repo.issues.filter(
+                                (i) => i.state?.toLowerCase() === "open"
+                              ).length;
+                              const closed = repo.issues.filter(
+                                (i) => i.state?.toLowerCase() === "closed"
+                              ).length;
+                              const other = repo.issues.length - open - closed;
+                              const pie = buildIssuePieSegments(open, closed, other);
+                              if (!pie) return null;
+                              let offset = 0;
+                              return (
+                                <div className="flex items-center justify-between mb-2 gap-3">
+                                  <div className="space-x-2 text-[11px] text-gray-500 dark:text-gray-400">
+                                    <span className="inline-flex items-center gap-1">
+                                      <span className="h-2 w-2 rounded-full bg-blue-500" /> Open
+                                    </span>
+                                    <span className="inline-flex items-center gap-1">
+                                      <span className="h-2 w-2 rounded-full bg-emerald-500" /> Closed
+                                    </span>
+                                    <span className="inline-flex items-center gap-1">
+                                      <span className="h-2 w-2 rounded-full bg-amber-400" /> Other
+                                    </span>
+                                  </div>
+                                  <svg
+                                    width={36}
+                                    height={36}
+                                    viewBox="0 0 40 40"
+                                    className="shrink-0"
+                                  >
+                                    <g transform="translate(20,20)">
+                                      {pie.segments.map((seg, idx) => {
+                                        const strokeDasharray = `${seg.len} ${pie.circumference}`;
+                                        const strokeDashoffset = -offset;
+                                        offset += seg.len;
+                                        return (
+                                          <circle
+                                            key={idx}
+                                            r={pie.radius}
+                                            className={seg.color}
+                                            strokeWidth={8}
+                                            fill="transparent"
+                                            strokeDasharray={strokeDasharray}
+                                            strokeDashoffset={strokeDashoffset}
+                                          />
+                                        );
+                                      })}
+                                    </g>
+                                  </svg>
+                                </div>
+                              );
+                            })()}
+                            <ul className="space-y-1 text-xs md:text-sm">
+                              {repo.issues.map((issue) => (
+                                <li key={issue.id} className="border border-gray-200 dark:border-gray-700 rounded px-2 py-1 space-y-1">
+                                  <div className="flex justify-between gap-2">
+                                    <div>
+                                      <div className="font-medium">{issue.title}</div>
+                                      {issue.state && (
+                                        <div className="text-[11px] text-gray-500 dark:text-gray-400">
+                                          Status: {issue.state}
+                                        </div>
+                                      )}
+                                    </div>
+                                    {issue.url && (
+                                      <a
+                                        href={issue.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="self-center text-[11px] font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                                      >
+                                        Open
+                                      </a>
                                     )}
                                   </div>
-                                  {issue.url && (
-                                    <a
-                                      href={issue.url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="self-center text-[11px] font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
-                                    >
-                                      Open
-                                    </a>
-                                  )}
-                                </div>
-                              </li>
-                            ))}
-                          </ul>
+                                </li>
+                              ))}
+                            </ul>
+                          </>
                         )}
                       </section>
 
@@ -425,50 +784,75 @@ export default async function ProjectDetailsPage({ params }: ProjectDetailsPageP
                             No releases.
                           </p>
                         ) : (
-                          <ul className="space-y-1 text-xs md:text-sm">
-                            {repo.releases.map((rel) => (
-                              <li
-                                key={rel.id}
-                                className="border border-gray-200 dark:border-gray-700 rounded px-2 py-1 space-y-1"
-                              >
-                                <div className="flex justify-between gap-2">
-                                  <div>
-                                    <div className="font-medium">{rel.tagName}</div>
-                                    {rel.name && (
-                                      <div className="text-[11px] text-gray-500 dark:text-gray-400">
-                                        {rel.name}
-                                      </div>
-                                    )}
-                                    {(rel.createdAt || rel.publishedAt) && (
-                                      <div className="text-[11px] text-gray-500 dark:text-gray-400">
-                                        {rel.createdAt && (
-                                          <span>
-                                            Created: {new Date(rel.createdAt).toLocaleDateString()}
-                                          </span>
-                                        )}
-                                        {rel.publishedAt && (
-                                          <span>
-                                            {rel.createdAt ? " · " : ""}
-                                            Published: {new Date(rel.publishedAt).toLocaleDateString()}
-                                          </span>
-                                        )}
-                                      </div>
+                          <>
+                            <div className="mb-1">
+                              {(() => {
+                                const path = buildSparklinePath(
+                                  repo.releases.map((rel) => rel.publishedAt ?? rel.createdAt)
+                                );
+                                if (!path) return null;
+                                return (
+                                  <svg
+                                    width="100%"
+                                    height={24}
+                                    viewBox="0 0 80 24"
+                                    className="text-blue-500"
+                                  >
+                                    <path
+                                      d={path}
+                                      className="stroke-current"
+                                      strokeWidth={2}
+                                      fill="none"
+                                    />
+                                  </svg>
+                                );
+                              })()}
+                            </div>
+                            <ul className="space-y-1 text-xs md:text-sm">
+                              {repo.releases.map((rel) => (
+                                <li
+                                  key={rel.id}
+                                  className="border border-gray-200 dark:border-gray-700 rounded px-2 py-1 space-y-1"
+                                >
+                                  <div className="flex justify-between gap-2">
+                                    <div>
+                                      <div className="font-medium">{rel.tagName}</div>
+                                      {rel.name && (
+                                        <div className="text-[11px] text-gray-500 dark:text-gray-400">
+                                          {rel.name}
+                                        </div>
+                                      )}
+                                      {(rel.createdAt || rel.publishedAt) && (
+                                        <div className="text-[11px] text-gray-500 dark:text-gray-400">
+                                          {rel.createdAt && (
+                                            <span>
+                                              Created: {new Date(rel.createdAt).toLocaleDateString()}
+                                            </span>
+                                          )}
+                                          {rel.publishedAt && (
+                                            <span>
+                                              {rel.createdAt ? " · " : ""}
+                                              Published: {new Date(rel.publishedAt).toLocaleDateString()}
+                                            </span>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                    {rel.url && (
+                                      <a
+                                        href={rel.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="self-center text-[11px] font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                                      >
+                                        Open
+                                      </a>
                                     )}
                                   </div>
-                                  {rel.url && (
-                                    <a
-                                      href={rel.url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="self-center text-[11px] font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
-                                    >
-                                      Open
-                                    </a>
-                                  )}
-                                </div>
-                              </li>
-                            ))}
-                          </ul>
+                                </li>
+                              ))}
+                            </ul>
+                          </>
                         )}
                       </section>
                     </div>
